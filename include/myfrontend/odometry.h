@@ -80,6 +80,15 @@ protected:
 
     // 把当前帧加入地图(如果是关键帧的话)
     void addKeyFrame();
+
+    // 同时优化相机位姿和3D点坐标
+    void poseAndPoint(const std::vector<cv::Point3f> &pts3d,
+                                const std::vector<cv::Point2f> &pts2d, 
+                                const cv::Mat &inliers);
+    // 只优化相机位姿
+    void onlyPose(const std::vector<cv::Point3f> &pts3d,
+                  const std::vector<cv::Point2f> &pts2d, 
+                  const cv::Mat &inliers);
 };
 
 } // namespace myfrontend

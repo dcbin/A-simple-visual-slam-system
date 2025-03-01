@@ -4,6 +4,7 @@
 #include "frame.h"
 #include "map.h"
 #include "odometry.h"
+#include "g2o_types.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
