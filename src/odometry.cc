@@ -4,9 +4,8 @@
 
 namespace myfrontend {
 
-Odometry::Odometry():state_(INITIALIZING), ref_(nullptr),
-                     curr_(nullptr), map_(new Map), num_inliers_(0),
-                     num_lost_(0) {
+Odometry::Odometry():state_(INITIALIZING),last_frame_(nullptr), curr_(nullptr),
+                     map_(new Map), num_inliers_(0), num_lost_(0) {
     num_features_ = Config::getParam<int>("num_features");
     num_inliers_min_ = Config::getParam<int>("num_inliers_min");
     key_frame_min_rot_ = Config::getParam<double>("key_frame_min_rot");
@@ -16,6 +15,10 @@ Odometry::Odometry():state_(INITIALIZING), ref_(nullptr),
     match_ratio_ = Config::getParam<int>("match_ratio");
     depth_scale_ = Config::getParam<float>("depth_scale");
     num_lost_max_ = Config::getParam<int>("num_lost_max");
+    iter_max_ = Config::getParam<int>("iter_max");
+    map_point_erase_ratio_ = Config::getParam<double>("map_point_erase_ratio");
+    map_point_erase_min_ = Config::getParam<int>("map_point_erase_min");
+    map_point_erase_max_ = Config::getParam<int>("map_point_erase_max");
     orb_ = cv::ORB::create(num_features_, scale_factor_, level_pyramid_);
 }
 
@@ -28,9 +31,29 @@ void Odometry::computeDescriptors() {
 }
 
 void Odometry::featureMatch() {
+    descriptor_map_ = cv::Mat().clone();
+    // 存放局部地图中在当前帧视野范围内的点
+    std::vector<MapPoint::Ptr> candidate_mappoints_;
+    std::vector<unsigned long> map_point_index;
+    /**
+     * @brief 从局部地图中筛选在当前帧视野范围内的点，并记录它的描述子
+     */
+    for(auto mappoint : map_->map_points_) {
+        const auto &p = mappoint.second;
+        if(curr_->isInFrame(p->pos_)) {
+            p->observed_times_++;
+            p->observed_frames_.emplace_back(curr_);
+            candidate_mappoints_.emplace_back(p);
+            map_point_index.emplace_back(p->id_);
+            descriptor_map_.push_back(p->descriptor_);
+        }
+    }
+    LOG(ERROR) << "视野范围内的地图点数量: " << candidate_mappoints_.size();
+    LOG(ERROR) << "局部地图描述子数量: " << descriptor_map_.rows;
     cv::BFMatcher matcher(cv::NORM_HAMMING);
     std::vector<cv::DMatch> matches; // 存放初始的匹配结果
-    matcher.match(descriptor_ref_, descriptor_curr_, matches);
+    matcher.match(descriptor_map_, descriptor_curr_, matches);
+
     // 选取最优匹配
     float min_dis = std::min_element(matches.begin(), matches.end(),
         [](const cv::DMatch &m1, const cv::DMatch &m2) {
@@ -38,44 +61,49 @@ void Odometry::featureMatch() {
         })->distance;
 
     feature_matches_.clear(); // 清空上一次的匹配结果
+    matched_3dpts_.clear();
+    matched_2dkp_index_.clear();
     for (cv::DMatch &m: matches) {
         if (m.distance < std::max<float>(min_dis * 2.0, 30.0)) {
             feature_matches_.push_back(m);
+            matched_3dpts_.push_back(candidate_mappoints_[m.queryIdx]);
+            map_->map_points_[map_point_index[m.queryIdx]]->matched_times_++;
+            matched_2dkp_index_.push_back(m.trainIdx);
         }
     }
-    LOG(ERROR) << "good matches: " << feature_matches_.size();
 }
 
 void Odometry::poseEstimationPnP() {
     // 准备PnP求解所需的数据
-    std::vector<cv::Point3f> pts3d; // 参考帧的相机坐标系下的3D点
+    std::vector<cv::Point3f> pts3d; // 局部地图世界坐标系下的3D点
     std::vector<cv::Point2f> pts2d; // 当前帧的像素坐标系下的2D点
 
-    std::vector<Vec3d> pts_world_eigen;
-    for (cv::DMatch &m: feature_matches_) {
-        pts3d.push_back(points_3d_ref_[m.queryIdx]);
-        pts2d.push_back(keypoints_curr_[m.trainIdx].pt);
+    for(auto &m : matched_3dpts_) {
+        pts3d.push_back(m->getPositionCV());
     }
+    for(auto &m : matched_2dkp_index_) {
+        pts2d.push_back(keypoints_curr_[m].pt);
+    }
+
     if(pts2d.size() == pts3d.size()) {
         LOG(ERROR) << "共有" << pts3d.size() << "对匹配点";
     }
     cv::Mat K = (cv::Mat_<double>(3, 3) << 
-        ref_->camera_->fx_, 0, ref_->camera_->cx_,
-        0, ref_->camera_->fy_, ref_->camera_->cy_,
-        0, 0, 1
-    );
+        curr_->camera_->fx_, 0, curr_->camera_->cx_,
+        0, curr_->camera_->fy_, curr_->camera_->cy_,
+        0, 0, 1);
     cv::Mat rvec, tvec, inliers;
     cv::solvePnPRansac(pts3d, pts2d, K, cv::Mat(), rvec, tvec, false, 10, 8.0, 0.99, inliers);
     num_inliers_ = inliers.rows;  // 更新内点数量
-    LOG(ERROR) << "pnp inliers: " << num_inliers_;
+    // LOG(ERROR) << "pnp inliers: " << num_inliers_;
     Eigen::Vector3d rvec_eigen(rvec.at<double>(0, 0), rvec.at<double>(1, 0), rvec.at<double>(2, 0));
-    T_c_r_estimated_ = Sophus::SE3d(
+    T_c_w_estimated_ = Sophus::SE3d(
         Sophus::SO3d::exp(rvec_eigen),
         Vec3d(tvec.at<double>(0, 0), tvec.at<double>(1, 0), tvec.at<double>(2, 0))
     );
-    LOG(ERROR) << "pnp解算的变换矩阵: \n" << T_c_r_estimated_.matrix();
-    poseAndPoint(pts3d, pts2d, inliers);
-    // onlyPose(pts3d, pts2d, inliers);
+    LOG(ERROR) << "pnp解算的变换矩阵: \n" << T_c_w_estimated_.matrix();
+    // poseAndPoint(pts3d, pts2d, inliers);
+    onlyPose(pts3d, pts2d, inliers);
 }
 
 bool Odometry::checkEstimatedPose() {
@@ -83,18 +111,19 @@ bool Odometry::checkEstimatedPose() {
         LOG(ERROR) << "内点数量过少,丢弃此次估计!";
         return false;
     }
-
-    if(T_c_r_estimated_.log().norm() > 5.0) {
-        LOG(ERROR) << "相机位移异常偏大,丢弃此次估计!";
+    Sophus::SE3d T_c_r_ = last_frame_->T_c_w_ * T_c_w_estimated_.inverse();
+    if(T_c_r_.log().norm() > 2.0) {
+        LOG(ERROR) << "相机运动异常偏大,丢弃此次估计!";
         return false;
     }
     return true;
 }
 
 bool Odometry::checkKeyFrame() {
-    Sophus::SO3d R = T_c_r_estimated_.rotationMatrix();
+    Sophus::SE3d T_c_r = last_frame_->T_c_w_ * T_c_w_estimated_.inverse();
+    Sophus::SO3d R(T_c_r.rotationMatrix());
     Sophus::Vector3d rot_vec = R.log();
-    Sophus::Vector3d trans_vec = T_c_r_estimated_.translation();
+    Sophus::Vector3d trans_vec = T_c_r.translation();
 
     if(rot_vec.norm() < key_frame_min_rot_ &&
        trans_vec.norm() < key_frame_min_trans_) {
@@ -104,39 +133,16 @@ bool Odometry::checkKeyFrame() {
     return true;
 }
 
-void Odometry::setRef3DPoints() {
-    points_3d_ref_.clear();
-    // 清空参考帧的特征描述子
-    descriptor_ref_ = cv::Mat().clone();
-    for (int i = 0; i < keypoints_curr_.size(); i++) {
-        float x = keypoints_curr_[i].pt.x;
-        float y = keypoints_curr_[i].pt.y;
-
-        Vec2d pts_uv(x, y);
-        double depth = curr_->findDepth(keypoints_curr_[i]);
-        if (depth <= 0 || !std::isfinite(depth)) {
-            continue; // 跳过深度丢失或错误的特征点
-        }
-        Vec3d point_3d_ref = curr_->camera_->pixel2camera(pts_uv, depth);
-        cv::Point3f point(point_3d_ref(0, 0),
-                          point_3d_ref(1, 0),
-                          point_3d_ref(2, 0));
-        points_3d_ref_.emplace_back(point);
-        descriptor_ref_.push_back(descriptor_curr_.row(i));
-    }
-}
-
 bool Odometry::addFrame(Frame::Ptr &frame) {
     if(state_ == Odometry::odometry_state::INITIALIZING){
-        ref_ = curr_ = frame;
-        ref_->T_c_w_ = Sophus::SE3d(); // 这里ref_和curr_指针指向一致
-        T_c_r_estimated_ = Sophus::SE3d();
+        curr_ = last_frame_ = frame;
+        T_c_w_estimated_ = Sophus::SE3d();
+        last_frame_->T_c_w_ = T_c_w_estimated_;
         timer t1 = std::chrono::steady_clock::now();
         extractKeyPoints();
         timer t2 = std::chrono::steady_clock::now();
         computeDescriptors();
         timer t3 = std::chrono::steady_clock::now();
-        setRef3DPoints();
         addKeyFrame();
         state_ = odometry_state::OK;
         LOG(ERROR) << "里程计初始化成功!\n"
@@ -147,12 +153,14 @@ bool Odometry::addFrame(Frame::Ptr &frame) {
     }
     else if(state_ == odometry_state::OK) {
         curr_ = frame;
+        curr_->T_c_w_ = last_frame_->T_c_w_;
         timer t1 = std::chrono::steady_clock::now();
         extractKeyPoints();
         timer t2 = std::chrono::steady_clock::now();
         computeDescriptors();
         timer t3 = std::chrono::steady_clock::now();
         featureMatch();
+        LOG(ERROR) << "特征匹配完成!";
         timer t4 = std::chrono::steady_clock::now();
         poseEstimationPnP();
         timer t5 = std::chrono::steady_clock::now();
@@ -162,13 +170,13 @@ bool Odometry::addFrame(Frame::Ptr &frame) {
                    << std::chrono::duration_cast<std::chrono::duration<double>>(t3 - t2).count()
                    << "\n 特征匹配用时:" 
                    << std::chrono::duration_cast<std::chrono::duration<double>>(t4 - t3).count()
-                   << "\n pnp解算用时:" 
+                   << "\n 位姿估计用时:" 
                    << std::chrono::duration_cast<std::chrono::duration<double>>(t5 - t4).count();         
         if(checkEstimatedPose()) {
-            curr_->T_c_w_  = T_c_r_estimated_ * ref_->T_c_w_;
+            curr_->T_c_w_  = T_c_w_estimated_;
+            optimizeMap();
             num_lost_ = 0;
-            setRef3DPoints();
-            ref_ = curr_;
+            last_frame_ = curr_;
             if(checkKeyFrame()) {
                 addKeyFrame();
             }
@@ -190,7 +198,83 @@ bool Odometry::addFrame(Frame::Ptr &frame) {
 }
 
 void Odometry::addKeyFrame() {
+    if(map_->keyframes_.empty()) {
+        for(int i = 0; i < keypoints_curr_.size(); i++) {
+            cv::KeyPoint key_point = keypoints_curr_[i];
+            double depth = curr_->findDepth(key_point);
+            if(depth <= 0)
+                continue;
+            Vec2d p_uv(key_point.pt.x, key_point.pt.y);
+            Vec3d p_w = last_frame_->camera_->pixel2world(p_uv, T_c_w_estimated_, depth);
+            Vec3d n = p_w - last_frame_->getCamPosition();
+            n.normalize();
+            MapPoint::Ptr map_point = MapPoint::createMapPoint(p_w, n, descriptor_curr_.row(i).clone(), last_frame_);
+            map_point->observed_times_++;
+            map_->insertMapPoint(map_point);
+        }
+        LOG(ERROR) << "第一帧中的所有特征点作为路标点!";
+    }
     map_->insertKeyFrame(curr_);
+    last_frame_ = curr_;
+}
+
+double Odometry::getViewAngle(Frame::Ptr frame, MapPoint::Ptr point) {
+    Vec3d n = point->pos_ - frame->getCamPosition();
+    n.normalize();
+    return acos(n.transpose() * point->norm_);
+}
+
+void Odometry::addMapPoints() {
+    std::vector<bool> matched(keypoints_curr_.size(), false);
+    for(auto &m : feature_matches_) {
+        matched[m.trainIdx] = true;
+    }
+    for(int i = 0; i < keypoints_curr_.size(); i++) {
+        if(matched[i])
+            continue;
+        double depth = curr_->findDepth(keypoints_curr_[i]);
+        if(depth <= 0)
+            continue;
+        Vec2d p_uv(keypoints_curr_[i].pt.x, keypoints_curr_[i].pt.y);
+        Vec3d p_w = curr_->camera_->pixel2world(p_uv, T_c_w_estimated_, depth);
+        Vec3d n = p_w - curr_->getCamPosition();
+        n.normalize();
+        MapPoint::Ptr map_point = MapPoint::createMapPoint(p_w, n, descriptor_curr_.row(i).clone(), curr_);
+        map_point->observed_times_++;
+        map_->insertMapPoint(map_point);
+    }
+}
+
+void Odometry::optimizeMap() {
+    for(auto map_point_iter = map_->map_points_.begin(); map_point_iter != map_->map_points_.end();) {
+        if(!curr_->isInFrame(map_point_iter->second->pos_)) {
+            map_point_iter = map_->map_points_.erase(map_point_iter);
+            continue;
+        }
+        
+        float match_ratio = float(map_point_iter->second->matched_times_) /
+                            map_point_iter->second->observed_times_;
+        if(match_ratio < map_point_erase_ratio_) {
+            map_point_iter = map_->map_points_.erase(map_point_iter);
+            continue;
+        }
+        double angle = getViewAngle(curr_, map_point_iter->second);
+        if(angle > M_PI / 6.0) {
+            map_point_iter = map_->map_points_.erase(map_point_iter);
+            continue;
+        }
+        map_point_iter++;
+    }
+
+    if(map_->map_points_.size() < map_point_erase_min_) {
+        addMapPoints();
+    }
+    if(map_->map_points_.size() > map_point_erase_max_) {
+        map_point_erase_ratio_ += 0.05;
+    }
+    else {
+        map_point_erase_ratio_ = Config::getParam<double>("map_point_erase_ratio");
+    }
 }
 
 void Odometry::poseAndPoint(const std::vector<cv::Point3f> &pts3d,
@@ -210,8 +294,8 @@ void Odometry::poseAndPoint(const std::vector<cv::Point3f> &pts3d,
     // ----1.添加相机位姿顶点----
     g2o::VertexSE3Expmap *pose = new g2o::VertexSE3Expmap();
     pose->setId(0);
-    pose->setEstimate(g2o::SE3Quat(T_c_r_estimated_.rotationMatrix(),
-                                   T_c_r_estimated_.translation()));
+    pose->setEstimate(g2o::SE3Quat(T_c_w_estimated_.rotationMatrix(),
+                                   T_c_w_estimated_.translation()));
     
     // 随机给一个偏差较大的初始值,更容易看到误差下降
     // Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
@@ -250,7 +334,7 @@ void Odometry::poseAndPoint(const std::vector<cv::Point3f> &pts3d,
     optimizer_lh.initializeOptimization();
     // 最大迭代次数
     optimizer_lh.optimize(10);
-    T_c_r_estimated_ = Sophus::SE3d(
+    T_c_w_estimated_ = Sophus::SE3d(
                        pose->estimate().rotation(),
                        pose->estimate().translation());
 }
@@ -267,13 +351,13 @@ void Odometry::onlyPose(const std::vector<cv::Point3f> &pts3d,
     auto solver = new optimizer(std::move(block_solver));
     g2o::SparseOptimizer optimizer_lh;
     optimizer_lh.setAlgorithm(solver);
-    optimizer_lh.setVerbose(true); // 开启优化过程输出
+    // optimizer_lh.setVerbose(true); // 开启优化过程输出
     // 向优化器中添加顶点
     g2o::VertexSE3Expmap *pose = new g2o::VertexSE3Expmap();
     pose->setId(0);
     // 由于pnp的的初值已经很好,所以优化过程中的误差下降不会太明显
-    pose->setEstimate(g2o::SE3Quat(T_c_r_estimated_.rotationMatrix(),
-                                   T_c_r_estimated_.translation()));
+    pose->setEstimate(g2o::SE3Quat(T_c_w_estimated_.rotationMatrix(),
+                                   T_c_w_estimated_.translation()));
     
     // 随机给一个偏差较大的初始值,更容易看到误差下降
     // Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
@@ -295,14 +379,13 @@ void Odometry::onlyPose(const std::vector<cv::Point3f> &pts3d,
         edge->setRobustKernel( new g2o::RobustKernelHuber());
         optimizer_lh.addEdge(edge);
     }
-    LOG(ERROR) << "共" << optimizer_lh.edges().size() << "条边.";
     // 初始化
     optimizer_lh.initializeOptimization();
     // 最大迭代次数
-    optimizer_lh.optimize(10);
-    T_c_r_estimated_ = Sophus::SE3d(
+    optimizer_lh.optimize(iter_max_);
+    T_c_w_estimated_ = Sophus::SE3d(
                        pose->estimate().rotation(),
                        pose->estimate().translation());
-    LOG(ERROR) << "BA后的位姿:\n" << T_c_r_estimated_.matrix();
+    LOG(ERROR) << "BA后的位姿:\n" << T_c_w_estimated_.matrix();
 }
 } // namespace myfrontend

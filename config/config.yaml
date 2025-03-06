@@ -7,7 +7,7 @@ camera.cx: 325.1
 camera.cy: 249.7
 camera.depth_scale: 5000.0
 
-num_features: 800 # ORB求解的特征点数
+num_features: 1000 # ORB求解的特征点数
 num_inliers_min: 10 # 最小内点数
 keyframe_min_rot: 0.1
 keyframe_min_trans: 0.1 
@@ -15,3 +15,7 @@ level_pyramid: 4 # 图像金字塔层数
 scale_factor: 1.2 # 图像金字塔尺度因子
 match_ratio: 2.0 
 num_lost_max: 10 # 最大丢失次数
+iter_max: 5 # BA最大迭代次数
+map_point_erase_ratio: 0.3 # 地图点删除比例
+map_point_erase_min: 250 # 最小地图点数
+map_point_erase_max: 1000 # 最大地图点数
